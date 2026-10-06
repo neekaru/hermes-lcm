@@ -55,6 +55,8 @@ from .sqlite_util import (
     _prepare_private_sqlite_file,
     _restrict_existing_sqlite_artifacts,
     _temporary_sqlite_busy_timeout,
+    write_lock_for,
+    write_transaction,
 )
 from .tokens import count_message_tokens
 
@@ -351,7 +353,13 @@ class MessageStore:
         # aliasing could intersect SQLite's flush of a write. It does not
         # change semantics for single-threaded callers and adds only a single
         # uncontended ``RLock.acquire``/``release`` pair per operation.
-        self._write_lock = threading.RLock()
+        #
+        # The lock is the PROCESS-WIDE lock for this database file (shared with
+        # SummaryDAG, LifecycleStateStore, AssertionStore, ... which all point
+        # at the same lcm.db), NOT a per-store lock. Per-store locks let two
+        # stores write the same file concurrently in one process, which is the
+        # interleaving that historically corrupted the database.
+        self._write_lock = write_lock_for(self.db_path)
         self._init_db()
 
     def _init_db(self):
@@ -471,7 +479,7 @@ class MessageStore:
         observed_at = _normalize_observed_at(msg.get("timestamp"))
         ingested_at = time.time()
 
-        with self._write_lock:
+        with write_transaction(self._conn, self.db_path):
             cur = self._conn.execute(
                 """INSERT INTO messages
                    (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
@@ -495,7 +503,6 @@ class MessageStore:
                     "host_message_timestamp" if observed_at is not None else None,
                 ),
             )
-            self._conn.commit()
             return cur.lastrowid
 
     def append_batch(self, session_id: str,
@@ -534,7 +541,7 @@ class MessageStore:
             token_estimates = [0] * len(messages)
 
         ids = []
-        with self._write_lock, self._conn:
+        with write_transaction(self._conn, self.db_path):
             for msg, est in zip(messages, token_estimates):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
@@ -570,22 +577,20 @@ class MessageStore:
         """Move all persisted messages from one session_id to another."""
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
-        with self._write_lock:
+        with write_transaction(self._conn, self.db_path):
             cur = self._conn.execute(
                 "UPDATE messages SET session_id = ? WHERE session_id = ?",
                 (new_session_id, old_session_id),
             )
-            self._conn.commit()
             return cur.rowcount if cur.rowcount is not None else 0
 
     def delete_session_messages(self, session_id: str) -> int:
         """Delete all messages for a session. Returns count deleted."""
-        with self._write_lock:
+        with write_transaction(self._conn, self.db_path):
             cur = self._conn.execute(
                 "DELETE FROM messages WHERE session_id = ?",
                 (session_id,),
             )
-            self._conn.commit()
             deleted = cur.rowcount if cur.rowcount is not None else 0
             return deleted
 
@@ -605,7 +610,7 @@ class MessageStore:
         later batch archive would slice the new (short) content at the old chunk
         offsets, returning a garbled fragment (F2).
         """
-        with self._write_lock:
+        with write_transaction(self._conn, self.db_path):
             row = self._conn.execute(
                 "SELECT role, pinned, content, tool_call_id FROM messages WHERE store_id = ?",
                 (store_id,),
@@ -628,24 +633,21 @@ class MessageStore:
             )
             if before_commit is not None:
                 before_commit(self._conn, store_id)
-            self._conn.commit()
             return True
 
     def pin(self, store_id: int) -> None:
 
         """Mark a message as pinned (protected from pruning)."""
-        with self._write_lock:
+        with write_transaction(self._conn, self.db_path):
             self._conn.execute(
                 "UPDATE messages SET pinned = 1 WHERE store_id = ?", (store_id,)
             )
-            self._conn.commit()
 
     def unpin(self, store_id: int) -> None:
-        with self._write_lock:
+        with write_transaction(self._conn, self.db_path):
             self._conn.execute(
                 "UPDATE messages SET pinned = 0 WHERE store_id = ?", (store_id,)
             )
-            self._conn.commit()
 
     # -- Read operations ----------------------------------------------------
 
@@ -1040,7 +1042,7 @@ class MessageStore:
         """Normalize legacy NULL/blank source rows to the explicit unknown bucket."""
         stats_before = self.get_source_stats()
         blank_clause = _legacy_blank_source_clause("source")
-        with self._write_lock, self._conn:
+        with write_transaction(self._conn, self.db_path):
             cur = self._conn.execute(
                 f"UPDATE messages SET source = ? WHERE {blank_clause}",
                 (_UNKNOWN_SOURCE,),
@@ -1109,7 +1111,7 @@ class MessageStore:
         if conn is None:
             return False
         wrote = False
-        with self._write_lock:
+        with write_transaction(self._conn, self.db_path):
             for key in keys:
                 if skip_unchanged:
                     existing = conn.execute(
@@ -1126,8 +1128,6 @@ class MessageStore:
                     (key, serialized),
                 )
                 wrote = True
-            if wrote:
-                conn.commit()
         return wrote
 
     # -- Compaction telemetry ------------------------------------------------
@@ -1743,12 +1743,21 @@ class MessageStore:
         conn = getattr(self, "_conn", None)
         if conn:
             # Graceful shutdown hygiene: checkpoint committed WAL frames before
-            # releasing the connection.  This does not run on crash/kill, and
-            # PASSIVE can leave frames behind when another reader is active.
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass  # best-effort only; don't let this mask the real close()
+            # releasing the connection.  This does not run on crash/kill.
+            #
+            # PASSIVE was insufficient: it is silently skipped whenever any
+            # other connection holds a read transaction, so the WAL kept growing
+            # across restarts and every new boot had to recover a larger,
+            # partially-checkpointed log.  We now escalate RESTART -> TRUNCATE
+            # and only fall back on failure.  TRUNCATE leaves a zero-length WAL,
+            # so the next process starts from a clean end mark instead of
+            # racing a stale one.
+            for mode in ("RESTART", "TRUNCATE"):
+                try:
+                    conn.execute(f"PRAGMA wal_checkpoint({mode})")
+                    break
+                except sqlite3.Error:
+                    continue  # best-effort only; don't mask the real close()
             conn.close()
             self._conn = None
 

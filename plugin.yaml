@@ -18,3 +18,4 @@ provides_tools:
   - lcm_status
   - lcm_inspect
   - lcm_doctor
+python_runtime: external

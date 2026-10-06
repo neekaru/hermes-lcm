@@ -23,7 +23,7 @@ from .db_bootstrap import (
     run_versioned_migrations,
     verify_temporal_rollup_schema,
 )
-from .sqlite_util import _is_sqlite_locked_error
+from .sqlite_util import _is_sqlite_locked_error, write_lock_for
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ class RollupStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
-        self._write_lock = threading.RLock()
+        self._write_lock = write_lock_for(self.db_path)
         self._init_db()
 
     def _init_db(self) -> None:

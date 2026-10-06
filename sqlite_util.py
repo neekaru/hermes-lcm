@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import threading
 import uuid
 from contextlib import contextmanager
 from typing import Iterator, List
@@ -179,6 +180,114 @@ def _prepare_private_sqlite_file(path: Path) -> None:
             )
     finally:
         os.close(directory_fd)
+
+
+# --------------------------------------------------------------------------- #
+#  Global per-file write lock (single-writer serialization)
+# --------------------------------------------------------------------------- #
+#
+# Every LCM store (MessageStore, SummaryDAG, LifecycleStateStore,
+# AssertionStore, QueryViewStore, RollupStore, VectorStore, TrajectoryStore)
+# points at the *same* physical database file but used to own its own
+# ``threading.RLock``.  Because the locks were per-store, two stores in the
+# same process could enter a write transaction on the same file at the same
+# time -- Python-level serialization did not exist, and the only thing keeping
+# writers apart was SQLite's own file lock, which is exactly the interleaving
+# that produced the historical on-disk corruption.
+#
+# The registry below maps one resolved database path to ONE re-entrant lock.
+# Every store that writes to that file acquires the same lock object, so all
+# intra-process writes to one database are serialized by a single lock.  The
+# lock is keyed by the *path*, not the inode, so a database file that is
+# renamed/replaced (gateway restart, manual swap) keeps the same lock and no
+# writer can slip in against a stale mapping.
+#
+# Cross-process serialization is still SQLite's job: WAL + ``busy_timeout`` +
+# explicit ``BEGIN IMMEDIATE`` on every write transaction (see
+# ``write_transaction`` below).
+
+_write_locks_guard = threading.Lock()
+_write_locks: dict[str, threading.RLock] = {}
+
+
+def _canonical_db_key(db_path: object) -> str:
+    """Return a stable registry key for ``db_path``.
+
+    ``:memory:`` databases are private to their own connection, so they never
+    share a lock and always get a fresh unique key.
+    """
+    text = str(db_path)
+    if text == ":memory:" or text.startswith("file::memory:") or ":memory:" in text:
+        return f"\x00memory:{uuid.uuid4().hex}"
+    try:
+        return str(Path(text).resolve())
+    except Exception:  # pragma: no cover - defensive
+        return str(Path(text).absolute())
+
+
+def write_lock_for(db_path: object) -> threading.RLock:
+    """Return the single process-wide write lock for ``db_path``.
+
+    All stores bound to the same physical database file receive the *same*
+    lock object, so their write transactions can never overlap in-process.
+    """
+    key = _canonical_db_key(db_path)
+    with _write_locks_guard:
+        lock = _write_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _write_locks[key] = lock
+        return lock
+
+
+def reset_write_locks() -> None:
+    """Drop every registered write lock (test hygiene only)."""
+    with _write_locks_guard:
+        _write_locks.clear()
+
+
+def _in_transaction(conn: sqlite3.Connection) -> bool:
+    """Return True when ``conn`` is already inside an explicit transaction."""
+    try:
+        return bool(conn.in_transaction)
+    except Exception:  # pragma: no cover - very old sqlite3
+        return False
+
+
+@contextmanager
+def write_transaction(
+    conn: sqlite3.Connection,
+    db_path: object,
+    *,
+    immediate: bool = True,
+) -> Iterator[None]:
+    """Serialize one write transaction under the global per-file write lock.
+
+    Acquires the shared lock for ``db_path``, then opens ``BEGIN IMMEDIATE``
+    (unless the caller is already inside a transaction, in which case it joins
+    the outer one) and commits on success / rolls back on failure.  Using
+    ``BEGIN IMMEDIATE`` -- rather than a deferred transaction that upgrades on
+    first write -- makes lock contention visible up front so the configured
+    ``busy_timeout`` resolves it instead of failing mid-transaction.
+    """
+    lock = write_lock_for(db_path)
+    with lock:
+        began = False
+        if immediate and not _in_transaction(conn):
+            conn.execute("BEGIN IMMEDIATE")
+            began = True
+        try:
+            yield
+        except BaseException:
+            if began:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+            raise
+        else:
+            if began:
+                conn.commit()
 
 
 def _is_sqlite_locked_error(exc: BaseException) -> bool:

@@ -470,7 +470,8 @@ def hydrate_semantic_nodes(
         require_remaining("DAG setup")
         read_dag = copy.copy(engine._dag)
         read_dag._conn = conn
-        read_dag._db_lock = threading.RLock()
+        # Inherit the process-wide write lock from the source DAG; a fresh lock
+        # here would let the reader escape the shared serialization.
         require_remaining("DAG setup")
         hydrated: list[tuple[Any, float]] = []
         for embedded_id, score, kind in ranked_rows:

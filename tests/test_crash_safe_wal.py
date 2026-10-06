@@ -82,7 +82,19 @@ class TestConfigureConnectionPragmas:
         configure_connection(conn)
         val = conn.execute("PRAGMA mmap_size").fetchone()[0]
         conn.close()
-        assert val == 268_435_456, f"expected mmap_size=268435456, got {val}"
+        # mmap is intentionally DISABLED: a large mmap window keeps a mapping of
+        # a renamed/replaced inode alive, letting the process write stale pages
+        # into a file a sibling connection also owns (the historical corruption).
+        assert val == 0, f"expected mmap_size=0 (mmap disabled), got {val}"
+
+    def test_locking_mode_is_normal(self, db_path: Path):
+        conn = sqlite3.connect(str(db_path))
+        configure_connection(conn)
+        mode = conn.execute("PRAGMA locking_mode").fetchone()[0]
+        conn.close()
+        # NORMAL (not EXCLUSIVE): every connection is a potential writer in this
+        # deployment, so the lock must be releasable between transactions.
+        assert mode == "normal", f"expected locking_mode=normal, got {mode!r}"
 
 
 # --------------------------------------------------------------------------- #

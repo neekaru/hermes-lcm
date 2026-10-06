@@ -35,7 +35,7 @@ from .db_bootstrap import (
     verify_chunk_schema,
     verify_embedding_schema,
 )
-from .sqlite_util import _is_sqlite_locked_error
+from .sqlite_util import _is_sqlite_locked_error, write_lock_for
 
 logger = logging.getLogger(__name__)
 
@@ -337,7 +337,7 @@ class VectorStore:
             getattr(resolved_config, "embedding_binary_prescreen", False)
         )
         self._conn: Optional[sqlite3.Connection] = None
-        self._write_lock = threading.RLock()
+        self._write_lock = write_lock_for(self.db_path)
         self._cache_lock = threading.RLock()
         # Nesting depth for _write_transaction. The outermost entry owns the
         # BEGIN IMMEDIATE/COMMIT (one fsync); a re-entrant inner entry (e.g. a
@@ -1981,7 +1981,9 @@ class VectorStore:
             conn.set_progress_handler(interrupt_if_expired, 1000)
             reader = copy.copy(self)
             reader._conn = conn
-            reader._write_lock = threading.RLock()
+            # Inherit the process-wide write lock (do NOT replace it with a new
+            # RLock -- a fresh lock would let this reader bypass the shared
+            # serialization). The cache lock is per-reader scratch state.
             reader._cache_lock = threading.RLock()
             loaded = loader(reader)
             if _monotonic() >= deadline:

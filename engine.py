@@ -406,8 +406,24 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._assertion_extraction_last_error = ""
         self._assertion_extraction_last_model = ""
 
-        db_path = self._resolve_db_path(hermes_home)
-        self._bind_storage(db_path, hermes_home)
+        # Lazy storage bind: do NOT open the SQLite database here. Plugin
+        # discovery (``discover_plugins()``) constructs this engine from many
+        # short-lived, non-agent processes -- most importantly the external
+        # restart-safe cron workers, which call ``discover_plugins()`` on every
+        # tick purely to hydrate plugin secret sources. Eagerly opening lcm.db
+        # from those processes created a SECOND cross-process writer alongside
+        # the gateway, and their exit-time WAL cleanup could unlink ``-wal``/
+        # ``-shm`` out from under the live gateway mapping -- the exact
+        # multi-writer condition behind the on-disk corruption. Storage is now
+        # bound on first real use (session start / ingest / tool call / status).
+        self._storage_bound: bool = False
+        self._store = None
+        self._dag = None
+        self._lifecycle = None
+        self._assertions = None
+        self._query_views = None
+        self._adaptive_retrieval = None
+        self._assertion_extractor = None
 
         self._session_id: str = ""
         self._session_platform: str = ""
@@ -690,6 +706,26 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return Path(hermes_home) / "lcm.db"
         return Path.home() / ".hermes" / "lcm.db"
 
+    def _ensure_storage_bound(self, hermes_home: str = "") -> None:
+        """Bind SQLite storage on first real use (idempotent, thread-safe).
+
+        ``register()`` constructs the engine in every process that runs plugin
+        discovery -- including short-lived external cron workers that never
+        serve a session. Opening lcm.db from those processes made a second
+        cross-process writer next to the gateway and let their exit-time WAL
+        cleanup unlink ``-wal``/``-shm`` under the live gateway, which produced
+        the historical on-disk corruption. So the DB is opened only when the
+        engine actually needs it. Read-only callers that never touch the store
+        (status/identity before a session) simply stay unbound.
+        """
+        if self._storage_bound:
+            return
+        if hermes_home:
+            self._hermes_home = hermes_home
+        db_path = self._resolve_db_path(self._hermes_home or "")
+        self._bind_storage(db_path, self._hermes_home or "")
+        self._storage_bound = True
+
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
         self._assertions = None
@@ -738,6 +774,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         except Exception:
             self._close_storage()
             raise
+        self._storage_bound = True
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
@@ -2600,6 +2637,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._log_session_filter_diagnostics()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
+        # Bind storage on first real session (see _ensure_storage_bound). A
+        # discovered-but-unused engine in a short-lived cron worker never
+        # reaches here, so it never opens lcm.db.
+        self._ensure_storage_bound(str(kwargs.get("hermes_home") or ""))
         if "hermes_home" in kwargs:
             self._rebind_storage_for_home(str(kwargs.get("hermes_home") or ""))
 
@@ -3770,6 +3811,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         ]
 
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
+        # A real tool call is genuine use -> ensure storage is bound first.
+        self._ensure_storage_bound()
         # Ingest live messages if passed (enables current-turn search)
         messages = kwargs.get("messages")
 
@@ -3824,6 +3867,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         metadata = _plugin_metadata()
         git_identity = _git_runtime_identity(_PLUGIN_ROOT)
+        self._ensure_storage_bound()
         session_id = self.current_session_id
         conversation_id = self.current_conversation_id
         lifecycle_state = None
@@ -3867,6 +3911,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return identity
 
     def get_status(self) -> Dict[str, Any]:
+        self._ensure_storage_bound()
         status = super().get_status()
         status.update({
             "compression_count": self.compression_count,
@@ -4501,6 +4546,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         assistant loops replaced by quarantine placeholders. Existing callers may
         ignore the return value when they only need durable persistence.
         """
+        self._ensure_storage_bound()
         if not self._session_id:
             logger.debug("Ingest skipped: no session_id")
             return self._redact_active_replay_messages(messages)
@@ -6657,6 +6703,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._unregister_active_engine_binding()
         if self._adaptive_retrieval is not None:
             self._adaptive_retrieval.close()
+        if not self._storage_bound:
+            return
         self._store.close()
         self._dag.close()
         self._lifecycle.close()

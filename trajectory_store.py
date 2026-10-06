@@ -31,6 +31,7 @@ from .db_bootstrap import (
 )
 from .ingest_protection import redact_sensitive_value
 from .search_query import extract_search_terms
+from .sqlite_util import write_lock_for
 
 
 TRAJECTORY_MIGRATION_STEP = "trajectory_store_v1"
@@ -589,7 +590,7 @@ class TrajectoryStore:
         self._state_semantic_cache: (
             tuple[str, tuple[int, float], list[int], Any] | None
         ) = None
-        self._lock = threading.RLock()
+        self._lock = write_lock_for(self.db_path)
         self._conn = self._open_connection()
         try:
             self._validate_existing_schema_version()

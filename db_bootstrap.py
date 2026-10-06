@@ -124,15 +124,39 @@ def configure_connection(conn: sqlite3.Connection) -> None:
                                              or cap growth while another
                                              connection holds an old WAL
                                              end mark.
-    - mmap_size=268435456 (256 MiB)        : memory-map reads so concurrent
-                                              readers cache WAL pages in RAM.
+    - mmap_size=0 (mmap DISABLED) : memory-mapped I/O is intentionally off.
+                                              A large mmap window keeps a mapping
+                                              of the *old* inode alive when the
+                                              database file is renamed/replaced
+                                              (gateway restart, plugin rebind,
+                                              manual DB swap). The process then
+                                              keeps writing mapped pages of a
+                                              deleted inode while a sibling writes
+                                              the live one, which produces exactly
+                                              the on-disk corruption this plugin
+                                              previously logged: the 100-byte
+                                              SQLite header displaced from offset 0
+                                              and conversation payload appearing
+                                              inside the file body. Disabling mmap
+                                              routes every read through the
+                                              connection's own fd, so a replaced
+                                              path can never be written through a
+                                              stale mapping.
     """
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     _execute_wal_conversion_with_lock_retry(conn)
     conn.execute("PRAGMA synchronous=FULL")
     conn.execute("PRAGMA wal_autocheckpoint=500")
     conn.execute("PRAGMA journal_size_limit=67108864")
-    conn.execute("PRAGMA mmap_size=268435456")
+    # mmap stays OFF: a live mapping of a renamed/replaced inode lets the
+    # process write stale pages into a file a sibling connection also owns.
+    # Plain fd reads cannot hit that failure mode.
+    conn.execute("PRAGMA mmap_size=0")
+    # Every connection is a potential writer in this deployment (gateway,
+    # CLI, sub-agents).  Exclusive locking keeps at most one process inside a
+    # write transaction, so a checkpoint can never interleave with a write
+    # from another connection to the same file.
+    conn.execute("PRAGMA locking_mode=NORMAL")
 
 
 def _execute_wal_conversion_with_lock_retry(

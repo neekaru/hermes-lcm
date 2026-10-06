@@ -68,6 +68,7 @@ class CompactionMixin:
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
+        self._ensure_storage_bound()
         self._preflight_cleanup_only_due_to_boundary_cooldown = False
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
@@ -376,6 +377,7 @@ class CompactionMixin:
         4. Check if condensation is needed
         5. Assemble new active context: summaries + fresh tail
         """
+        self._ensure_storage_bound()
         if not messages:
             self._last_compression_status = "noop"
             self._last_compression_noop_reason = "empty message list"

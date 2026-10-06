@@ -50,6 +50,7 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .store import _normalize_source_value, _UNKNOWN_SOURCE, _legacy_blank_source_clause
+from .sqlite_util import write_lock_for
 
 
 logger = logging.getLogger(__name__)
@@ -164,7 +165,7 @@ class SummaryDAG:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
-        self._db_lock = threading.RLock()
+        self._db_lock = write_lock_for(self.db_path)
         self._init_db()
 
     @property
@@ -877,10 +878,15 @@ class SummaryDAG:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
+            # Escalate the checkpoint so the DAG sidecar does not leave WAL
+            # frames behind for the next boot (PASSIVE is skipped whenever
+            # another connection holds a read transaction).
+            for mode in ("RESTART", "TRUNCATE"):
+                try:
+                    conn.execute(f"PRAGMA wal_checkpoint({mode})")
+                    break
+                except sqlite3.Error:
+                    continue
             conn.close()
             self._conn = None
 

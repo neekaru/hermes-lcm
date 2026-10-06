@@ -29,6 +29,7 @@ from .db_bootstrap import (
     run_versioned_migrations,
     verify_assertion_schema,
 )
+from .sqlite_util import write_lock_for
 
 
 CURRENT_EXTRACTION_VERSION = "assertions-v1"
@@ -218,7 +219,7 @@ class AssertionStore:
     def __init__(self, db_path: str | Path, *, read_only: bool = False):
         self.db_path = Path(db_path)
         self.read_only = bool(read_only)
-        self._write_lock = threading.RLock()
+        self._write_lock = write_lock_for(self.db_path)
         self._conn = self._open_connection()
         try:
             self._init_db()

@@ -27,6 +27,7 @@ from .db_bootstrap import (
     refuse_schema_version_too_new,
     run_versioned_migrations,
 )
+from .sqlite_util import write_lock_for
 
 
 QUERY_VIEW_MIGRATION_STEP = "query_views_v1"
@@ -538,7 +539,7 @@ class QueryViewStore:
         self._conn = sqlite3.connect(
             str(self.db_path), timeout=5.0, check_same_thread=False
         )
-        self._write_lock = threading.RLock()
+        self._write_lock = write_lock_for(self.db_path)
         try:
             refuse_schema_version_too_new(self._conn)
             configure_connection(self._conn)

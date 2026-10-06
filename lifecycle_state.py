@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
+from .sqlite_util import write_lock_for
 
 
 def _synchronized(method):
@@ -62,7 +63,7 @@ class LifecycleStateStore:
         # and is shared across the gateway thread, dispatcher, and sub-agents.
         # Serialize read-modify-write flows so concurrent binds/frontier
         # advances cannot interleave and regress the checkpoint.
-        self._lock = threading.RLock()
+        self._lock = write_lock_for(self.db_path)
         self._init_db()
 
     def _init_db(self) -> None:
@@ -81,10 +82,15 @@ class LifecycleStateStore:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
+            # Escalate the checkpoint so this sidecar does not leave WAL frames
+            # behind for the next boot to recover (PASSIVE is skipped whenever
+            # another connection holds a read transaction).
+            for mode in ("RESTART", "TRUNCATE"):
+                try:
+                    conn.execute(f"PRAGMA wal_checkpoint({mode})")
+                    break
+                except sqlite3.Error:
+                    continue
             conn.close()
             self._conn = None
 
