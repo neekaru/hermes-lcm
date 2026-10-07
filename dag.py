@@ -184,7 +184,15 @@ class SummaryDAG:
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
-        self._conn.executescript("""
+        # Startup DDL + migrations + FTS bootstrap + commit under the shared
+        # per-file write lock (same rationale as MessageStore._init_db).
+        with self._db_lock:
+            self._init_schema_locked()
+
+    def _init_schema_locked(self):
+        conn = self._conn
+        assert conn is not None
+        conn.executescript("""
             CREATE TABLE IF NOT EXISTS summary_nodes (
                 node_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -212,12 +220,12 @@ class SummaryDAG:
             );
         """)
         ensure_external_content_fts(
-            self._conn,
+            conn,
             build_nodes_fts_spec(),
         )
-        run_versioned_migrations(self._conn)
+        run_versioned_migrations(conn)
         self._ensure_source_window_columns()
-        self._conn.commit()
+        conn.commit()
 
     def _ensure_source_window_columns(self) -> None:
         columns = {

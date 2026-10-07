@@ -417,6 +417,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # multi-writer condition behind the on-disk corruption. Storage is now
         # bound on first real use (session start / ingest / tool call / status).
         self._storage_bound: bool = False
+        # Guards the lazy bind below. ``_ensure_storage_bound`` is documented as
+        # thread-safe and is reached from several threads at once (gateway
+        # handler, dispatcher, sub-agents, tool calls). Without a lock, two
+        # threads could both observe ``_storage_bound is False`` and both run
+        # ``_bind_storage``, opening a SECOND set of connections to the same
+        # lcm.db in one process -- exactly the extra-writer condition this
+        # redesign removes. The loser's stores were also never closed.
+        self._storage_bind_lock = threading.Lock()
         self._store = None
         self._dag = None
         self._lifecycle = None
@@ -720,11 +728,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         if self._storage_bound:
             return
-        if hermes_home:
-            self._hermes_home = hermes_home
-        db_path = self._resolve_db_path(self._hermes_home or "")
-        self._bind_storage(db_path, self._hermes_home or "")
-        self._storage_bound = True
+        # Double-checked locking: the fast path above avoids the lock once
+        # bound; the lock serializes concurrent first-use binds so only ONE
+        # thread opens the connection set for this process.
+        with self._storage_bind_lock:
+            if self._storage_bound:
+                return
+            if hermes_home:
+                self._hermes_home = hermes_home
+            db_path = self._resolve_db_path(self._hermes_home or "")
+            self._bind_storage(db_path, self._hermes_home or "")
+            self._storage_bound = True
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""

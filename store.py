@@ -368,7 +368,16 @@ class MessageStore:
         configure_connection(self._conn)
         if not self._is_memory_database:
             _restrict_existing_sqlite_artifacts(self.db_path)
-        self._conn.executescript("""
+        # Startup DDL + migrations + FTS bootstrap + commit run under the shared
+        # per-file write lock so a concurrent bind of another store on the same
+        # lcm.db cannot interleave its own migration writes with ours.
+        with self._write_lock:
+            self._init_schema_locked()
+
+    def _init_schema_locked(self) -> None:
+        conn = self._conn
+        assert conn is not None
+        conn.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -397,14 +406,14 @@ class MessageStore:
             );
         """)
         ensure_external_content_fts(
-            self._conn,
+            conn,
             build_message_fts_spec(),
         )
-        run_versioned_migrations(self._conn)
+        run_versioned_migrations(conn)
         self._ensure_source_column()
         self._ensure_conversation_id_column()
         self._ensure_time_contract_columns()
-        self._conn.commit()
+        conn.commit()
 
     def _ensure_source_column(self) -> None:
         columns = {

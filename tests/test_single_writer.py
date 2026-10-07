@@ -167,3 +167,94 @@ def test_write_transaction_rolls_back_on_error(tmp_path: Path):
         pass
     assert conn.execute("SELECT count(*) FROM t").fetchone()[0] == 0
     conn.close()
+
+
+def test_background_integrity_scan_takes_the_shared_write_lock(tmp_path: Path):
+    """The background FTS scan writes metadata on its OWN connections.
+
+    Those connections do not inherit any store lock, so the scan must take the
+    shared per-file lock itself. If it does not, holding that lock in the test
+    thread will NOT block the scan -- which is exactly the interleaving that
+    corrupted the b-tree. So: hold the lock, start the scan, and assert it does
+    not finish until the lock is released.
+    """
+    _reset()
+    from hermes_lcm import db_bootstrap as db_bootstrap
+    from hermes_lcm.store import build_message_fts_spec
+    from hermes_lcm.sqlite_util import write_lock_for
+
+    db_path = tmp_path / "scan.db"
+    store = MessageStore(db_path)
+    store.append("s1", {"role": "user", "content": "hello world"})
+    store.close()
+
+    spec = build_message_fts_spec()
+    lock = write_lock_for(db_path)
+    finished = threading.Event()
+
+    def run_scan():
+        db_bootstrap._run_background_integrity_scan(str(db_path), spec, 0.0)
+        finished.set()
+
+    with lock:
+        thread = threading.Thread(target=run_scan, daemon=True)
+        thread.start()
+        assert not finished.wait(2.0), (
+            "background scan wrote metadata without taking the shared write lock"
+        )
+    assert finished.wait(30.0), "background scan did not finish after lock release"
+    thread.join(timeout=5.0)
+
+
+def test_engine_storage_bind_is_single_flight(tmp_path: Path):
+    """Concurrent first-use binds must open exactly ONE connection set.
+
+    ``_ensure_storage_bound`` is reachable from many threads at once. Without a
+    guard, two threads both see ``_storage_bound is False`` and both bind,
+    leaving a second set of connections (extra writers) on the same lcm.db.
+    """
+    _reset()
+    try:
+        from hermes_lcm.engine import LCMEngine
+        from hermes_lcm.config import LCMConfig
+    except Exception:  # pragma: no cover - engine needs the host agent package
+        import pytest
+
+        pytest.skip("host agent package unavailable for engine import")
+
+    cfg = LCMConfig.from_env()
+    cfg.database_path = str(tmp_path / "engine.db")
+    engine = LCMEngine(config=cfg, hermes_home=str(tmp_path))
+
+    calls: list[int] = []
+    original = engine._bind_storage
+
+    def counting_bind(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    engine._bind_storage = counting_bind  # type: ignore[assignment]
+
+    barrier = threading.Barrier(16)
+    errors: list[BaseException] = []
+
+    def bind():
+        try:
+            barrier.wait(timeout=30.0)
+            engine._ensure_storage_bound(str(tmp_path))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=bind) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60.0)
+
+    try:
+        assert not errors, f"bind raised under contention: {errors!r}"
+        assert len(calls) == 1, f"expected exactly one bind, saw {len(calls)}"
+    finally:
+        close = getattr(engine, "_close_storage", None)
+        if callable(close):
+            close()

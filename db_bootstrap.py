@@ -2676,6 +2676,27 @@ def _clear_scan_started(
         )
 
 
+# --------------------------------------------------------------------------- #
+#  Shared-writer serialization for the background integrity scan
+# --------------------------------------------------------------------------- #
+#
+# The background FTS integrity scan below opens its OWN sqlite connections
+# (it must not drive the store's connection from another thread), so it does
+# NOT inherit the store's process-wide write lock.  Every store on lcm.db takes
+# the SAME ``write_lock_for(db_path)`` lock around its write transactions; a
+# metadata write from this scan thread that skipped that lock could interleave
+# with a store write transaction on the shared file and corrupt the b-tree
+# (freelist damage, duplicate page references, rowid/child-depth errors -- the
+# exact on-disk damage this scan exists to detect).  So every write the scan
+# performs takes the shared lock too.  Imported lazily to keep the module's
+# import graph acyclic at load time.
+def _lcm_write_lock(db_path: str):
+    """Return the shared process-wide write lock for ``db_path``."""
+    from .sqlite_util import write_lock_for
+
+    return write_lock_for(db_path)
+
+
 def _run_background_integrity_scan(
     db_path: str, spec: ExternalContentFtsSpec, started_at: float
 ) -> None:
@@ -2685,6 +2706,9 @@ def _run_background_integrity_scan(
     issued as an INSERT command that rolls back inside a savepoint, so it never
     mutates data, but it does require a writable handle) and a separate brief
     connection to stamp the result. On corruption it flags rather than rebuilds.
+
+    Every write takes the shared per-file write lock so this thread serializes
+    with the stores that share ``db_path`` (see ``_lcm_write_lock``).
     """
     key = (db_path, spec.table_name)
     timeout = SQLITE_BUSY_TIMEOUT_MS / 1000.0
@@ -2694,9 +2718,10 @@ def _run_background_integrity_scan(
             scan_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
             # Persist the scan-started stamp on this DB so a crash mid-scan is
             # detectable cross-process via the staleness window above.
-            _record_scan_started(scan_conn, spec, now=started_at)
-            scan_conn.commit()
-            result = check_external_content_fts_integrity(scan_conn, spec)
+            with _lcm_write_lock(db_path):
+                _record_scan_started(scan_conn, spec, now=started_at)
+                scan_conn.commit()
+                result = check_external_content_fts_integrity(scan_conn, spec)
         finally:
             scan_conn.close()
 
@@ -2704,23 +2729,25 @@ def _run_background_integrity_scan(
         try:
             meta_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
             status = result.get("status")
-            if status == "pass":
-                _record_integrity_checked(meta_conn, spec, now=started_at)
-                _clear_integrity_failed(meta_conn, spec)
-            elif status == "fail":
-                _record_integrity_failed(
-                    meta_conn, spec, detail=result.get("detail", ""), now=started_at
-                )
+            with _lcm_write_lock(db_path):
+                if status == "pass":
+                    _record_integrity_checked(meta_conn, spec, now=started_at)
+                    _clear_integrity_failed(meta_conn, spec)
+                elif status == "fail":
+                    _record_integrity_failed(
+                        meta_conn, spec, detail=result.get("detail", ""), now=started_at
+                    )
+                # 'unchecked' (e.g. a read-only DB): leave the throttle marker unset
+                # so the next bind retries; do not stamp or flag.
+                _clear_scan_started(meta_conn, spec, expected=started_at)
+                meta_conn.commit()
+            if status == "fail":
                 logger.warning(
                     "Background FTS integrity-check found corruption in '%s': %s. "
                     "Run `/lcm doctor repair apply` to rebuild the index.",
                     spec.table_name,
                     result.get("detail", ""),
                 )
-            # 'unchecked' (e.g. a read-only DB): leave the throttle marker unset
-            # so the next bind retries; do not stamp or flag.
-            _clear_scan_started(meta_conn, spec, expected=started_at)
-            meta_conn.commit()
         finally:
             meta_conn.close()
     except Exception:  # pragma: no cover - defensive
@@ -2730,8 +2757,9 @@ def _run_background_integrity_scan(
         try:
             cleanup = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
             try:
-                _clear_scan_started(cleanup, spec, expected=started_at)
-                cleanup.commit()
+                with _lcm_write_lock(db_path):
+                    _clear_scan_started(cleanup, spec, expected=started_at)
+                    cleanup.commit()
             finally:
                 cleanup.close()
         except sqlite3.DatabaseError:
@@ -2781,9 +2809,10 @@ def _dispatch_background_integrity_scan(
             )
             try:
                 claim_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-                claim_conn.execute("BEGIN IMMEDIATE")
-                _record_scan_started(claim_conn, spec, now=current)
-                claim_conn.commit()
+                with _lcm_write_lock(db_path):
+                    claim_conn.execute("BEGIN IMMEDIATE")
+                    _record_scan_started(claim_conn, spec, now=current)
+                    claim_conn.commit()
             finally:
                 claim_conn.close()
         except sqlite3.DatabaseError:
@@ -2835,9 +2864,16 @@ def _fts_needs_rebuild(
     if throttle and _background_integrity_enabled():
         if _dispatch_background_integrity_scan(conn, spec, now=now):
             return False
-    result = check_external_content_fts_integrity(conn, spec)
-    if result["status"] == "pass":
-        _record_integrity_checked(conn, spec, now=now)
+    db_path = _database_path_for_connection(conn)
+    if db_path and db_path != ":memory:":
+        with _lcm_write_lock(db_path):
+            result = check_external_content_fts_integrity(conn, spec)
+            if result["status"] == "pass":
+                _record_integrity_checked(conn, spec, now=now)
+    else:
+        result = check_external_content_fts_integrity(conn, spec)
+        if result["status"] == "pass":
+            _record_integrity_checked(conn, spec, now=now)
     return result["status"] == "fail"
 
 

@@ -76,8 +76,11 @@ class LifecycleStateStore:
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         self._conn.row_factory = sqlite3.Row
-        run_versioned_migrations(self._conn)
-        self._conn.commit()
+        # Migrations + commit under the shared per-file write lock so a
+        # concurrent bind of another store on the same lcm.db cannot interleave.
+        with self._lock:
+            run_versioned_migrations(self._conn)
+            self._conn.commit()
 
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
